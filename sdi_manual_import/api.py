@@ -133,3 +133,61 @@ def process_supplier_invoice_fixed(
     frappe.db.commit()
 
     return pi_name
+
+
+@frappe.whitelist()
+def import_from_folder(company=None):
+    """
+    Scansiona la cartella privata 'sdi_passive_incoming', importa ogni XML
+    trovato come Fattura Fornitori SDI riusando upload_supplier_invoice_xml
+    (che blocca automaticamente i duplicati gia' presenti per P.IVA + numero
+    fattura, indipendentemente dallo stato Importata/Da importare), e sposta
+    i file elaborati in sdi_passive_processati o sdi_passive_errori.
+
+    Returns:
+        Lista di dict {file, status, doc|message} con l'esito per ogni file,
+        dove status e' 'success', 'duplicate' o 'error'.
+    """
+    import os
+    import shutil
+
+    if not company:
+        company = frappe.defaults.get_user_default("Company")
+        if not company:
+            frappe.throw(_("Nessuna Company di default impostata per l'utente"))
+
+    base = frappe.utils.get_site_path("private", "files")
+    incoming_dir = os.path.join(base, "sdi_passive_incoming")
+    processed_dir = os.path.join(base, "sdi_passive_processati")
+    error_dir = os.path.join(base, "sdi_passive_errori")
+
+    for d in (incoming_dir, processed_dir, error_dir):
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+    xml_files = sorted(f for f in os.listdir(incoming_dir) if f.lower().endswith(".xml"))
+
+    results = []
+    for filename in xml_files:
+        filepath = os.path.join(incoming_dir, filename)
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                xml_content = f.read()
+
+            doc_name = upload_supplier_invoice_xml(xml_content, company=company)
+            shutil.move(filepath, os.path.join(processed_dir, filename))
+            results.append({"file": filename, "status": "success", "doc": doc_name})
+
+        except Exception as e:
+            frappe.db.rollback()
+            message = str(e)
+            is_duplicate = "già importata" in message
+
+            shutil.move(filepath, os.path.join(processed_dir if is_duplicate else error_dir, filename))
+            results.append({
+                "file": filename,
+                "status": "duplicate" if is_duplicate else "error",
+                "message": message,
+            })
+
+    return results

@@ -6,11 +6,27 @@ from frappe import _
 from sdi_manual_import.xml_parser import parse_fatturapa_xml
 
 
+def _save_xml_attachment(doc, xml_content):
+    """Salva l'XML originale come allegato del record, per uso futuro (es. PDF)."""
+    _file = frappe.get_doc(
+        {
+            "doctype": "File",
+            "file_name": f"{doc.name}.xml",
+            "attached_to_doctype": doc.doctype,
+            "attached_to_name": doc.name,
+            "is_private": True,
+            "content": xml_content,
+        }
+    )
+    _file.save(ignore_permissions=True)
+
+
 @frappe.whitelist()
 def upload_supplier_invoice_xml(xml_content, company=None):
     """
     Riceve il contenuto testuale di un XML FatturaPA fornitore,
     lo converte in JSON e crea il record 'Fattura Fornitori SDI'.
+    Conserva anche l'XML originale come allegato (per generare il PDF in seguito).
     """
     if not company:
         company = frappe.defaults.get_user_default("Company")
@@ -56,6 +72,9 @@ def upload_supplier_invoice_xml(xml_content, company=None):
         }
     )
     doc.insert(ignore_permissions=True)
+
+    _save_xml_attachment(doc, xml_content)
+
     frappe.db.commit()
 
     return doc.name
@@ -106,9 +125,8 @@ def process_supplier_invoice_fixed(
     """
     Wrapper attorno a italian_invoice.utilities.fatture_passive.process_supplier_invoice
     che:
-    1. Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga (vedi _fix_prezzo_unitario)
-    2. Ripristina il calcolo normale del Rounding Adjustment (disable_rounded_total = 0),
-       uniformando le fatture importate a quelle create manualmente da UI.
+    1. Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga
+    2. Ripristina il calcolo normale del Rounding Adjustment (disable_rounded_total = 0)
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -140,13 +158,9 @@ def import_from_folder(company=None):
     """
     Scansiona la cartella privata 'sdi_passive_incoming', importa ogni XML
     trovato come Fattura Fornitori SDI riusando upload_supplier_invoice_xml
-    (che blocca automaticamente i duplicati gia' presenti per P.IVA + numero
-    fattura, indipendentemente dallo stato Importata/Da importare), e sposta
-    i file elaborati in sdi_passive_processati o sdi_passive_errori.
-
-    Returns:
-        Lista di dict {file, status, doc|message} con l'esito per ogni file,
-        dove status e' 'success', 'duplicate' o 'error'.
+    (che blocca automaticamente i duplicati e salva anche l'XML originale
+    come allegato), e sposta i file elaborati in sdi_passive_processati
+    o sdi_passive_errori.
     """
     import os
     import shutil
@@ -191,3 +205,51 @@ def import_from_folder(company=None):
             })
 
     return results
+
+
+@frappe.whitelist()
+def download_pdf(docname):
+    """
+    Genera un PDF a partire dall'XML originale allegato al record,
+    usando il Foglio di Stile AssoSoftware (trasformazione XSLT ufficiale
+    in stile FatturaPA) e il motore di generazione PDF gia' incluso in Frappe.
+    """
+    doc = frappe.get_doc("Fattura Fornitori SDI", docname)
+    frappe.has_permission(doc=doc, throw=True)
+
+    files = frappe.get_all(
+        "File",
+        filters={
+            "attached_to_doctype": "Fattura Fornitori SDI",
+            "attached_to_name": docname,
+            "file_name": ["like", "%.xml"],
+        },
+        fields=["name"],
+        limit=1,
+    )
+    if not files:
+        frappe.throw(_("XML originale non trovato per questa fattura (fatture importate prima di questo aggiornamento non ce l'hanno)"))
+
+    file_doc = frappe.get_doc("File", files[0].name)
+    xml_bytes = file_doc.get_content()
+    if isinstance(xml_bytes, str):
+        xml_bytes = xml_bytes.encode("utf-8")
+
+    from lxml import etree
+
+    xslt_path = frappe.get_app_path("sdi_manual_import", "xsl", "FoglioStileAssoSoftware.xsl")
+
+    parser = etree.XMLParser(recover=True)
+    xml_doc = etree.fromstring(xml_bytes, parser=parser)
+    xslt_doc = etree.parse(xslt_path)
+    transform = etree.XSLT(xslt_doc)
+    html_result = transform(xml_doc)
+    html_str = str(html_result)
+
+    from frappe.utils.pdf import get_pdf
+
+    pdf_content = get_pdf(html_str)
+
+    frappe.local.response.filename = f"{docname}.pdf"
+    frappe.local.response.filecontent = pdf_content
+    frappe.local.response.type = "download"

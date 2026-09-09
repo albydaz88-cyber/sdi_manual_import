@@ -241,12 +241,11 @@ def download_pdf(docname):
 
     pdf_options = {
         "page-size": "A4",
-        "orientation": "Landscape",
         "margin-top": "5mm",
         "margin-bottom": "5mm",
         "margin-left": "5mm",
         "margin-right": "5mm",
-        "zoom": "0.8",
+        "zoom": "0.90",
         "enable-local-file-access": None,
     }
 

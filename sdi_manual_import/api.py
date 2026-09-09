@@ -237,8 +237,7 @@ def download_pdf(docname):
 
     from lxml import etree
 
-    xslt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xsl", "FoglioStileAssoSoftware.xsl")
-    import os
+    xslt_path = frappe.get_app_path("sdi_manual_import", "xsl", "FoglioStileAssoSoftware.xsl")
 
     parser = etree.XMLParser(recover=True)
     xml_doc = etree.fromstring(xml_bytes, parser=parser)

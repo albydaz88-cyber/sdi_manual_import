@@ -97,9 +97,6 @@ def get_or_create_supplier(supplier_vat_id, invoice_data):
 def _fix_prezzo_unitario(invoice_data):
     """
     Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga.
-    PrezzoUnitario nel FatturaPA puo' avere fino a 8 decimali e non sempre
-    e' coerente con PrezzoTotale (arrotondamenti residui del fornitore),
-    generando rumore decimale nel totale finale della Purchase Invoice.
     """
     from italian_invoice.utilities.fatture import get_fattura_body
 
@@ -124,9 +121,7 @@ def process_supplier_invoice_fixed(
 ):
     """
     Wrapper attorno a italian_invoice.utilities.fatture_passive.process_supplier_invoice
-    che:
-    1. Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga
-    2. Ripristina il calcolo normale del Rounding Adjustment (disable_rounded_total = 0)
+    che corregge prezzo_unitario e ripristina il Rounding Adjustment normale.
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -156,11 +151,7 @@ def process_supplier_invoice_fixed(
 @frappe.whitelist()
 def import_from_folder(company=None):
     """
-    Scansiona la cartella privata 'sdi_passive_incoming', importa ogni XML
-    trovato come Fattura Fornitori SDI riusando upload_supplier_invoice_xml
-    (che blocca automaticamente i duplicati e salva anche l'XML originale
-    come allegato), e sposta i file elaborati in sdi_passive_processati
-    o sdi_passive_errori.
+    Scansiona la cartella privata 'sdi_passive_incoming' e importa ogni XML trovato.
     """
     import os
     import shutil
@@ -211,8 +202,8 @@ def import_from_folder(company=None):
 def download_pdf(docname):
     """
     Genera un PDF a partire dall'XML originale allegato al record,
-    usando il Foglio di Stile AssoSoftware (trasformazione XSLT ufficiale
-    in stile FatturaPA) e il motore di generazione PDF gia' incluso in Frappe.
+    usando il Foglio di Stile AssoSoftware. Formato Landscape per
+    contenere le tabelle larghe del foglio di stile senza tagli.
     """
     doc = frappe.get_doc("Fattura Fornitori SDI", docname)
     frappe.has_permission(doc=doc, throw=True)
@@ -228,7 +219,7 @@ def download_pdf(docname):
         limit=1,
     )
     if not files:
-        frappe.throw(_("XML originale non trovato per questa fattura (fatture importate prima di questo aggiornamento non ce l'hanno)"))
+        frappe.throw(_("XML originale non trovato per questa fattura"))
 
     file_doc = frappe.get_doc("File", files[0].name)
     xml_bytes = file_doc.get_content()
@@ -237,7 +228,7 @@ def download_pdf(docname):
 
     from lxml import etree
 
-    xslt_path = frappe.get_app_path("sdi_manual_import", "xsl", "FoglioStileAssoSoftware.xsl")
+    xslt_path = frappe.get_app_path("sdi_manual_import", "xsl", "fogliostileassosoftware.xsl")
 
     parser = etree.XMLParser(recover=True)
     xml_doc = etree.fromstring(xml_bytes, parser=parser)
@@ -248,7 +239,18 @@ def download_pdf(docname):
 
     from frappe.utils.pdf import get_pdf
 
-    pdf_content = get_pdf(html_str)
+    pdf_options = {
+        "page-size": "A4",
+        "orientation": "Landscape",
+        "margin-top": "5mm",
+        "margin-bottom": "5mm",
+        "margin-left": "5mm",
+        "margin-right": "5mm",
+        "zoom": "0.8",
+        "enable-local-file-access": None,
+    }
+
+    pdf_content = get_pdf(html_str, options=pdf_options)
 
     frappe.local.response.filename = f"{docname}.pdf"
     frappe.local.response.filecontent = pdf_content

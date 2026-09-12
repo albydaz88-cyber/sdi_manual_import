@@ -7,12 +7,12 @@ from sdi_manual_import.xml_parser import parse_fatturapa_xml
 from sdi_manual_import.metadata_parser import get_data_registrazione, file_root, is_metadata_file
 
 
-def _save_xml_attachment(doc, xml_content):
+def _save_xml_attachment(doc, xml_content, original_filename=None):
     """Salva l'XML originale come allegato del record, per uso futuro (es. PDF)."""
     _file = frappe.get_doc(
         {
             "doctype": "File",
-            "file_name": f"{doc.name}.xml",
+            "file_name": original_filename or f"{doc.name}.xml",
             "attached_to_doctype": doc.doctype,
             "attached_to_name": doc.name,
             "is_private": True,
@@ -23,7 +23,7 @@ def _save_xml_attachment(doc, xml_content):
 
 
 @frappe.whitelist()
-def upload_supplier_invoice_xml(xml_content, company=None, metadata_content=None):
+def upload_supplier_invoice_xml(xml_content, company=None, metadata_content=None, original_filename=None):
     """
     Riceve il contenuto testuale di un XML FatturaPA fornitore (e opzionalmente
     il contenuto del file metadati companion), lo converte in JSON e crea il
@@ -82,7 +82,7 @@ def upload_supplier_invoice_xml(xml_content, company=None, metadata_content=None
     )
     doc.insert(ignore_permissions=True)
 
-    _save_xml_attachment(doc, xml_content)
+    _save_xml_attachment(doc, xml_content, original_filename)
 
     frappe.db.commit()
 
@@ -158,6 +158,7 @@ def process_supplier_invoice_fixed(
                 else data_registrazione
             )
             pi.posting_date = posting_date
+            pi.set_posting_time = 1
 
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
@@ -221,7 +222,7 @@ def import_from_folder(company=None):
                     metadata_content = f.read()
 
             doc_name = upload_supplier_invoice_xml(
-                xml_content, company=company, metadata_content=metadata_content
+                xml_content, company=company, metadata_content=metadata_content, original_filename=filename
             )
 
             shutil.move(filepath, os.path.join(processed_dir, filename))

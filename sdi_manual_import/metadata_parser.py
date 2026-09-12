@@ -31,7 +31,7 @@ def file_root(filename):
 
 def is_metadata_file(filename):
     """I file metadati terminano sempre con '_metaDato' (case-insensitive)."""
-    return filename.lower().endswith("_metadato")
+    return "_metadato" in filename.lower()
 
 
 def _extract_field(xml_content, field_name):

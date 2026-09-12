@@ -4,6 +4,7 @@ import frappe
 from frappe import _
 
 from sdi_manual_import.xml_parser import parse_fatturapa_xml
+from sdi_manual_import.metadata_parser import get_data_registrazione, file_root, is_metadata_file
 
 
 def _save_xml_attachment(doc, xml_content):
@@ -22,11 +23,11 @@ def _save_xml_attachment(doc, xml_content):
 
 
 @frappe.whitelist()
-def upload_supplier_invoice_xml(xml_content, company=None):
+def upload_supplier_invoice_xml(xml_content, company=None, metadata_content=None):
     """
-    Riceve il contenuto testuale di un XML FatturaPA fornitore,
-    lo converte in JSON e crea il record 'Fattura Fornitori SDI'.
-    Conserva anche l'XML originale come allegato (per generare il PDF in seguito).
+    Riceve il contenuto testuale di un XML FatturaPA fornitore (e opzionalmente
+    il contenuto del file metadati companion), lo converte in JSON e crea il
+    record 'Fattura Fornitori SDI'. Conserva anche l'XML originale come allegato.
     """
     if not company:
         company = frappe.defaults.get_user_default("Company")
@@ -61,6 +62,13 @@ def upload_supplier_invoice_xml(xml_content, company=None):
             _("Questa fattura risulta già importata: {0}").format(existing)
         )
 
+    data_registrazione = None
+    if metadata_content:
+        try:
+            data_registrazione = get_data_registrazione(metadata_content)
+        except Exception:
+            data_registrazione = None
+
     doc = frappe.get_doc(
         {
             "doctype": "Fattura Fornitori SDI",
@@ -69,6 +77,7 @@ def upload_supplier_invoice_xml(xml_content, company=None):
             "denominazione_fornitore": denominazione,
             "company": company,
             "via_webhook": 1,
+            "custom_data_ricezione": data_registrazione,
         }
     )
     doc.insert(ignore_permissions=True)
@@ -82,10 +91,7 @@ def upload_supplier_invoice_xml(xml_content, company=None):
 
 @frappe.whitelist()
 def get_or_create_supplier(supplier_vat_id, invoice_data):
-    """
-    Wrapper whitelisted per italian_invoice.utilities.fatture_passive.get_or_create_supplier,
-    che non è esposta come endpoint HTTP nell'app originale.
-    """
+    """Wrapper whitelisted per fatture_passive.get_or_create_supplier."""
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
 
@@ -95,9 +101,7 @@ def get_or_create_supplier(supplier_vat_id, invoice_data):
 
 
 def _fix_prezzo_unitario(invoice_data):
-    """
-    Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga.
-    """
+    """Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga."""
     from italian_invoice.utilities.fatture import get_fattura_body
 
     body = get_fattura_body(invoice_data)
@@ -120,8 +124,10 @@ def process_supplier_invoice_fixed(
     invoice_data, fattura_fornitori_sdi=None, item_mappings=None, remember_mappings=None
 ):
     """
-    Wrapper attorno a italian_invoice.utilities.fatture_passive.process_supplier_invoice
-    che corregge prezzo_unitario e ripristina il Rounding Adjustment normale.
+    Wrapper attorno a fatture_passive.process_supplier_invoice che:
+    1. Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga
+    2. Ripristina il calcolo normale del Rounding Adjustment
+    3. Usa Data Registrazione (SDI) come Posting Date, se disponibile
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -140,6 +146,19 @@ def process_supplier_invoice_fixed(
     )
 
     pi = frappe.get_doc("Purchase Invoice", pi_name)
+
+    if fattura_fornitori_sdi:
+        data_registrazione = frappe.db.get_value(
+            "Fattura Fornitori SDI", fattura_fornitori_sdi, "custom_data_ricezione"
+        )
+        if data_registrazione:
+            posting_date = (
+                data_registrazione.date()
+                if hasattr(data_registrazione, "date")
+                else data_registrazione
+            )
+            pi.posting_date = posting_date
+
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
     pi.save(ignore_permissions=True)
@@ -151,7 +170,11 @@ def process_supplier_invoice_fixed(
 @frappe.whitelist()
 def import_from_folder(company=None):
     """
-    Scansiona la cartella privata 'sdi_passive_incoming' e importa ogni XML trovato.
+    Scansiona 'sdi_passive_incoming' e importa ogni fattura XML trovata.
+    Abbina automaticamente ogni fattura al suo file metadati companion
+    confrontando la "radice" del nome file (parte prima del primo punto),
+    che identifica univocamente la transazione SDI indipendentemente da
+    estensioni/maiuscole (vedi sdi_manual_import.metadata_parser.file_root).
     """
     import os
     import shutil
@@ -170,25 +193,58 @@ def import_from_folder(company=None):
         if not os.path.exists(d):
             os.makedirs(d)
 
-    xml_files = sorted(f for f in os.listdir(incoming_dir) if f.lower().endswith(".xml"))
+    all_files = sorted(os.listdir(incoming_dir))
+
+    junk = {".ds_store", "thumbs.db", "desktop.ini"}
+    all_files = [f for f in all_files if f.lower() not in junk and not f.startswith(".")]
+
+    metadata_files = [f for f in all_files if is_metadata_file(f)]
+    invoice_files = [f for f in all_files if f not in metadata_files]
+
+    metadata_by_root = {file_root(mf): mf for mf in metadata_files}
 
     results = []
-    for filename in xml_files:
+    for filename in invoice_files:
         filepath = os.path.join(incoming_dir, filename)
+        root = file_root(filename)
+        metadata_filename = metadata_by_root.get(root)
+        has_metadata = metadata_filename is not None
+        metadata_filepath = os.path.join(incoming_dir, metadata_filename) if has_metadata else None
+
         try:
             with open(filepath, encoding="utf-8") as f:
                 xml_content = f.read()
 
-            doc_name = upload_supplier_invoice_xml(xml_content, company=company)
+            metadata_content = None
+            if has_metadata:
+                with open(metadata_filepath, encoding="utf-8") as f:
+                    metadata_content = f.read()
+
+            doc_name = upload_supplier_invoice_xml(
+                xml_content, company=company, metadata_content=metadata_content
+            )
+
             shutil.move(filepath, os.path.join(processed_dir, filename))
-            results.append({"file": filename, "status": "success", "doc": doc_name})
+            if has_metadata:
+                shutil.move(metadata_filepath, os.path.join(processed_dir, metadata_filename))
+
+            results.append({
+                "file": filename,
+                "status": "success",
+                "doc": doc_name,
+                "metadata_found": has_metadata,
+            })
 
         except Exception as e:
             frappe.db.rollback()
             message = str(e)
             is_duplicate = "già importata" in message
 
-            shutil.move(filepath, os.path.join(processed_dir if is_duplicate else error_dir, filename))
+            dest_dir = processed_dir if is_duplicate else error_dir
+            shutil.move(filepath, os.path.join(dest_dir, filename))
+            if has_metadata and os.path.exists(metadata_filepath):
+                shutil.move(metadata_filepath, os.path.join(dest_dir, metadata_filename))
+
             results.append({
                 "file": filename,
                 "status": "duplicate" if is_duplicate else "error",
@@ -202,8 +258,7 @@ def import_from_folder(company=None):
 def download_pdf(docname):
     """
     Genera un PDF a partire dall'XML originale allegato al record,
-    usando il Foglio di Stile AssoSoftware. Formato Landscape per
-    contenere le tabelle larghe del foglio di stile senza tagli.
+    usando il Foglio di Stile AssoSoftware. Formato A4.
     """
     doc = frappe.get_doc("Fattura Fornitori SDI", docname)
     frappe.has_permission(doc=doc, throw=True)

@@ -27,7 +27,8 @@ def upload_supplier_invoice_xml(xml_content, company=None, metadata_content=None
     """
     Riceve il contenuto testuale di un XML FatturaPA fornitore (e opzionalmente
     il contenuto del file metadati companion), lo converte in JSON e crea il
-    record 'Fattura Fornitori SDI'. Conserva anche l'XML originale come allegato.
+    record 'Fattura Fornitori SDI'. Conserva anche l'XML originale come allegato,
+    con il nome file originale se fornito.
     """
     if not company:
         company = frappe.defaults.get_user_default("Company")
@@ -119,6 +120,40 @@ def _fix_prezzo_unitario(invoice_data):
             continue
 
 
+def _extract_due_date(invoice_data):
+    """
+    Estrae la data di scadenza pagamento (DataScadenzaPagamento) dal JSON.
+    Se sono presenti piu' rate (DettaglioPagamento multipli), usa la scadenza
+    piu' tardiva come Due Date complessiva della fattura.
+    """
+    import datetime
+
+    from italian_invoice.utilities.fatture import get_fattura_body
+
+    body = get_fattura_body(invoice_data)
+    if not body:
+        return None
+
+    dati_pagamento = body.get("dati_pagamento") or []
+    if isinstance(dati_pagamento, dict):
+        dati_pagamento = [dati_pagamento]
+
+    scadenze = []
+    for dp in dati_pagamento:
+        dettagli = dp.get("dettaglio_pagamento") or []
+        if isinstance(dettagli, dict):
+            dettagli = [dettagli]
+        for d in dettagli:
+            scadenza = d.get("data_scadenza_pagamento")
+            if scadenza:
+                try:
+                    scadenze.append(datetime.date.fromisoformat(scadenza))
+                except (ValueError, TypeError):
+                    continue
+
+    return max(scadenze) if scadenze else None
+
+
 @frappe.whitelist()
 def process_supplier_invoice_fixed(
     invoice_data, fattura_fornitori_sdi=None, item_mappings=None, remember_mappings=None
@@ -128,6 +163,7 @@ def process_supplier_invoice_fixed(
     1. Corregge prezzo_unitario = prezzo_totale / quantita per ogni riga
     2. Ripristina il calcolo normale del Rounding Adjustment
     3. Usa Data Registrazione (SDI) come Posting Date, se disponibile
+    4. Usa DataScadenzaPagamento come Due Date, se presente nell'XML
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -160,6 +196,10 @@ def process_supplier_invoice_fixed(
             pi.posting_date = posting_date
             pi.set_posting_time = 1
 
+    due_date = _extract_due_date(invoice_data)
+    if due_date:
+        pi.due_date = due_date
+
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
     pi.save(ignore_permissions=True)
@@ -173,9 +213,7 @@ def import_from_folder(company=None):
     """
     Scansiona 'sdi_passive_incoming' e importa ogni fattura XML trovata.
     Abbina automaticamente ogni fattura al suo file metadati companion
-    confrontando la "radice" del nome file (parte prima del primo punto),
-    che identifica univocamente la transazione SDI indipendentemente da
-    estensioni/maiuscole (vedi sdi_manual_import.metadata_parser.file_root).
+    confrontando la "radice" del nome file (parte prima del primo punto).
     """
     import os
     import shutil
@@ -222,7 +260,10 @@ def import_from_folder(company=None):
                     metadata_content = f.read()
 
             doc_name = upload_supplier_invoice_xml(
-                xml_content, company=company, metadata_content=metadata_content, original_filename=filename
+                xml_content,
+                company=company,
+                metadata_content=metadata_content,
+                original_filename=filename,
             )
 
             shutil.move(filepath, os.path.join(processed_dir, filename))

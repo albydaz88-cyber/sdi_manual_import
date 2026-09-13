@@ -196,13 +196,14 @@ def process_supplier_invoice_fixed(
             pi.posting_date = posting_date
             pi.set_posting_time = 1
 
-    due_date = _extract_due_date(invoice_data)
-    if due_date:
-        pi.due_date = due_date
-
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
     pi.save(ignore_permissions=True)
+
+    due_date = _extract_due_date(invoice_data)
+    if due_date:
+        frappe.db.set_value("Purchase Invoice", pi.name, "due_date", due_date)
+
     frappe.db.commit()
 
     return pi_name

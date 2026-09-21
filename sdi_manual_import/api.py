@@ -142,12 +142,12 @@ def _get_declared_imponibile(invoice_data):
 
 def _get_tolerance_account(company):
     """
-    Risolve il nome esatto del conto 'Differenze Arrotondamento Fatture' per
+    Risolve il nome esatto del conto '8410093 - DIFFERENZE ARROTONDAMENTO FATTURE' per
     la company, includendo l'abbreviazione (come per gli account/template
     aziendali, il nome reale ha sempre il suffisso "- ABBR").
     """
     abbr = frappe.db.get_value("Company", company, "abbr")
-    account_name = f"Differenze Arrotondamento Fatture - {abbr}"
+    account_name = f"8410093 - DIFFERENZE ARROTONDAMENTO FATTURE - {abbr}"
     if not frappe.db.exists("Account", account_name):
         frappe.throw(
             _("Account '{0}' non trovato. Crealo nel Piano dei Conti prima di procedere.").format(account_name)

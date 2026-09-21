@@ -2,6 +2,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.utils import flt
 
 from sdi_manual_import.xml_parser import parse_fatturapa_xml
 from sdi_manual_import.metadata_parser import get_data_registrazione, file_root, is_metadata_file
@@ -120,38 +121,69 @@ def _fix_prezzo_unitario(invoice_data):
             continue
 
 
-def _extract_due_date(invoice_data):
+def _get_declared_imponibile(invoice_data):
     """
-    Estrae la data di scadenza pagamento (DataScadenzaPagamento) dal JSON.
-    Se sono presenti piu' rate (DettaglioPagamento multipli), usa la scadenza
-    piu' tardiva come Due Date complessiva della fattura.
+    Somma l'imponibile dichiarato nel riepilogo IVA dell'XML (dati_riepilogo),
+    il valore "ufficiale" secondo il fornitore, da confrontare con la somma
+    che ERPNext calcola dalle righe (net_total).
     """
-    import datetime
-
     from italian_invoice.utilities.fatture import get_fattura_body
 
     body = get_fattura_body(invoice_data)
     if not body:
         return None
 
-    dati_pagamento = body.get("dati_pagamento") or []
-    if isinstance(dati_pagamento, dict):
-        dati_pagamento = [dati_pagamento]
+    riepilogo = body.get("dati_beni_servizi", {}).get("dati_riepilogo", [])
+    try:
+        return round(sum(float(r.get("imponibile_importo", 0)) for r in riepilogo), 2)
+    except (TypeError, ValueError):
+        return None
 
-    scadenze = []
-    for dp in dati_pagamento:
-        dettagli = dp.get("dettaglio_pagamento") or []
-        if isinstance(dettagli, dict):
-            dettagli = [dettagli]
-        for d in dettagli:
-            scadenza = d.get("data_scadenza_pagamento")
-            if scadenza:
-                try:
-                    scadenze.append(datetime.date.fromisoformat(scadenza))
-                except (ValueError, TypeError):
-                    continue
 
-    return max(scadenze) if scadenze else None
+def _get_tolerance_account(company):
+    """
+    Risolve il nome esatto del conto 'Differenze Arrotondamento Fatture' per
+    la company, includendo l'abbreviazione (come per gli account/template
+    aziendali, il nome reale ha sempre il suffisso "- ABBR").
+    """
+    abbr = frappe.db.get_value("Company", company, "abbr")
+    account_name = f"Differenze Arrotondamento Fatture - {abbr}"
+    if not frappe.db.exists("Account", account_name):
+        frappe.throw(
+            _("Account '{0}' non trovato. Crealo nel Piano dei Conti prima di procedere.").format(account_name)
+        )
+    return account_name
+
+
+def _inject_rounding_tolerance(pi, invoice_data):
+    """
+    Confronta l'imponibile dichiarato nell'XML (dati_riepilogo) con la somma
+    che ERPNext calcola dalle righe (net_total). Se c'e' uno scarto (tipicamente
+    1-2 centesimi, residuo fisiologico anche dopo _fix_prezzo_unitario), lo
+    inietta come riga 'Purchase Taxes and Charges' con category:
+    - "Valuation and Total" se la fattura movimenta il magazzino (update_stock):
+      lo scarto viene spalmato sulla valorizzazione degli articoli, stile SAP PPV
+    - "Total" altrimenti: lo scarto va a conto economico, senza toccare il magazzino
+    """
+    declared_imponibile = _get_declared_imponibile(invoice_data)
+    if declared_imponibile is None:
+        return
+
+    diff = round(declared_imponibile - flt(pi.net_total), 2)
+    if diff == 0:
+        return
+
+    account = _get_tolerance_account(pi.company)
+    category = "Valuation and Total" if pi.get("update_stock") else "Total"
+
+    pi.append("taxes", {
+        "charge_type": "Actual",
+        "account_head": account,
+        "tax_amount": diff,
+        "category": category,
+        "add_deduct_tax": "Add",
+        "description": _("Differenza di arrotondamento SDI vs somma righe ({0})").format(diff),
+    })
 
 
 @frappe.whitelist()
@@ -164,6 +196,10 @@ def process_supplier_invoice_fixed(
     2. Ripristina il calcolo normale del Rounding Adjustment
     3. Usa Data Registrazione (SDI) come Posting Date, se disponibile
     4. Usa DataScadenzaPagamento come Due Date, se presente nell'XML
+    5. Ripristina il rate sulle righe tasse Actual (per il Registro IVA)
+    6. Inietta lo scarto di arrotondamento residuo (imponibile XML vs somma
+       righe ERPNext) come riga di tolleranza, spalmata sul magazzino o a
+       conto economico a seconda che la fattura movimenti stock
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -196,9 +232,26 @@ def process_supplier_invoice_fixed(
             pi.posting_date = posting_date
             pi.set_posting_time = 1
 
+    _inject_rounding_tolerance(pi, invoice_data)
+
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
     pi.save(ignore_permissions=True)
+
+    import re
+
+    tax_rows = frappe.get_all(
+        "Purchase Taxes and Charges",
+        filters={"parent": pi.name, "parenttype": "Purchase Invoice"},
+        fields=["name", "rate", "description"],
+    )
+    for row in tax_rows:
+        if not row.rate:
+            match = re.search(r"(\d+(?:\.\d+)?)\s*%", row.description or "")
+            if match:
+                frappe.db.set_value(
+                    "Purchase Taxes and Charges", row.name, "rate", float(match.group(1))
+                )
 
     due_date = _extract_due_date(invoice_data)
     if due_date:
@@ -207,6 +260,39 @@ def process_supplier_invoice_fixed(
     frappe.db.commit()
 
     return pi_name
+
+
+def _extract_due_date(invoice_data):
+    """
+    Estrae la data di scadenza pagamento (DataScadenzaPagamento) dal JSON.
+    Se sono presenti piu' rate, usa la scadenza piu' tardiva.
+    """
+    import datetime
+
+    from italian_invoice.utilities.fatture import get_fattura_body
+
+    body = get_fattura_body(invoice_data)
+    if not body:
+        return None
+
+    dati_pagamento = body.get("dati_pagamento") or []
+    if isinstance(dati_pagamento, dict):
+        dati_pagamento = [dati_pagamento]
+
+    scadenze = []
+    for dp in dati_pagamento:
+        dettagli = dp.get("dettaglio_pagamento") or []
+        if isinstance(dettagli, dict):
+            dettagli = [dettagli]
+        for d in dettagli:
+            scadenza = d.get("data_scadenza_pagamento")
+            if scadenza:
+                try:
+                    scadenze.append(datetime.date.fromisoformat(scadenza))
+                except (ValueError, TypeError):
+                    continue
+
+    return max(scadenze) if scadenze else None
 
 
 @frappe.whitelist()

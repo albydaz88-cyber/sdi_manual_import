@@ -164,10 +164,20 @@ def _inject_rounding_tolerance(pi, invoice_data):
     - "Valuation and Total" se la fattura movimenta il magazzino (update_stock):
       lo scarto viene spalmato sulla valorizzazione degli articoli, stile SAP PPV
     - "Total" altrimenti: lo scarto va a conto economico, senza toccare il magazzino
+
+    Note di credito: nell'XML gli importi sono positivi, mentre le righe della
+    Purchase Invoice di reso hanno quantita' negative (net_total < 0). Il dichiarato
+    va quindi portato in negativo, altrimenti lo "scarto" e' il doppio dell'imponibile
+    (es. +8,16 dichiarato contro -8,16 delle righe = 16,32 di falso arrotondamento).
+    Lo scarto e' calcolato sugli importi della nota di credito stessa: se la fattura
+    originaria aveva una riga di arrotondamento, la nota di credito ne ha una speculare.
     """
     declared_imponibile = _get_declared_imponibile(invoice_data)
     if declared_imponibile is None:
         return
+
+    if pi.get("is_return"):
+        declared_imponibile = -abs(declared_imponibile)
 
     diff = round(declared_imponibile - flt(pi.net_total), 2)
     if diff == 0:
@@ -186,6 +196,254 @@ def _inject_rounding_tolerance(pi, invoice_data):
     })
 
 
+# ---------------------------------------------------------------------------
+# Elementi della testata XML che non sono righe articolo: cassa previdenziale,
+# bollo, ritenuta d'acconto. Conti e articolo sono configurabili qui.
+# ---------------------------------------------------------------------------
+
+# Il conto si cerca per numero (campo "Account Number" del piano dei conti) nella
+# company della fattura, quindi vale per qualunque abbreviazione.
+CONTO_BOLLO = "8405005"       # 8405005 - IMPOSTA DI BOLLO
+CONTO_RITENUTA = "4805085"    # 4805085 - ERARIO C/RIT. LAVORO AUTONOMO
+ITEM_CASSA = "Contributo Cassa Previdenziale"
+
+
+def _as_list(value):
+    if not value:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _get_dati_generali_documento(invoice_data):
+    from italian_invoice.utilities.fatture import get_fattura_body
+
+    body = get_fattura_body(invoice_data)
+    if not body:
+        return {}
+    return body.get("dati_generali", {}).get("dati_generali_documento", {}) or {}
+
+
+def _get_riepilogo(invoice_data):
+    from italian_invoice.utilities.fatture import get_fattura_body
+
+    body = get_fattura_body(invoice_data)
+    if not body:
+        return []
+    return _as_list(body.get("dati_beni_servizi", {}).get("dati_riepilogo"))
+
+
+def _segno(pi):
+    """-1 sulle note di credito: righe e tasse della PI di reso sono negative."""
+    return -1 if pi.get("is_return") else 1
+
+
+def _get_account_by_number(company, number):
+    account = frappe.db.get_value(
+        "Account", {"company": company, "account_number": number, "is_group": 0}, "name"
+    )
+    if not account:
+        account = frappe.db.get_value(
+            "Account",
+            {"company": company, "name": ["like", f"{number} - %"], "is_group": 0},
+            "name",
+        )
+    return account
+
+
+def _get_or_create_item(item_code, item_name):
+    """Articolo di servizio per le righe che non hanno un articolo in anagrafica
+    (contributo cassa). Se non si riesce a crearlo ripiega sull'articolo generico
+    gia' usato dall'importer."""
+    if frappe.db.exists("Item", item_code):
+        return item_code
+
+    try:
+        item_group = (
+            frappe.db.get_single_value("Stock Settings", "item_group")
+            or frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+        )
+        item = frappe.get_doc({
+            "doctype": "Item",
+            "item_code": item_code,
+            "item_name": item_name,
+            "item_group": item_group,
+            "stock_uom": frappe.db.get_single_value("Stock Settings", "stock_uom") or "Nos",
+            "is_stock_item": 0,
+        })
+        item.insert(ignore_permissions=True, ignore_mandatory=True)
+        return item.name
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "SDI import: creazione articolo cassa")
+        from italian_invoice.utilities.fatture_passive import get_default_item_code
+
+        return get_default_item_code()
+
+
+def _remove_empty_group_tax_rows(pi):
+    """prepare_invoice_taxes crea, per le righe con aliquota 0 e natura, una riga
+    tassa a importo 0 sul conto IVA con tax_rate 0 - che nel piano dei conti e' il
+    conto padre 'CREDITI TRIBUTARI' (gruppo). La natura e' gia' sulle righe
+    articolo e nel riepilogo XML: la riga vuota non serve e punta a un conto che
+    non e' movimentabile."""
+    da_togliere = [
+        t for t in pi.get("taxes") or []
+        if not flt(t.tax_amount)
+        and t.account_head
+        and frappe.db.get_value("Account", t.account_head, "is_group")
+    ]
+    for riga in da_togliere:
+        pi.remove(riga)
+    for idx, riga in enumerate(pi.get("taxes") or [], 1):
+        riga.idx = idx
+
+
+def _add_cassa_items(pi, invoice_data):
+    """Il contributo della cassa previdenziale (DatiCassaPrevidenziale) non e' una
+    riga articolo, ma e' compreso nell'imponibile del riepilogo IVA. Senza questa
+    riga lo scarto finiva nella 'differenza di arrotondamento' (es. 40,00 su 1.000
+    di imponibile con cassa al 4%) e il costo non risultava per natura.
+    Si aggiunge come articolo di servizio, con l'aliquota/natura indicate per la cassa."""
+    dati = _get_dati_generali_documento(invoice_data)
+    aggiunte = False
+
+    for cassa in _as_list(dati.get("dati_cassa_previdenziale")):
+        importo = flt(cassa.get("importo_contributo_cassa"))
+        if not importo:
+            continue
+
+        tipo = cassa.get("tipo_cassa") or ""
+        percentuale = cassa.get("al_cassa")
+        descrizione = f"Contributo cassa previdenziale {tipo}".strip()
+        if percentuale:
+            descrizione += f" ({percentuale}%)"
+
+        item_code = _get_or_create_item(ITEM_CASSA, "Contributo cassa previdenziale")
+        uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
+        qty = _segno(pi)
+
+        pi.append("items", {
+            "item_code": item_code,
+            "item_name": frappe.db.get_value("Item", item_code, "item_name") or item_code,
+            "description": descrizione,
+            "qty": qty,
+            "rate": abs(importo),
+            "price_list_rate": abs(importo),
+            "uom": uom,
+            "stock_uom": uom,
+            "conversion_factor": 1,
+            "tax_rate": flt(cassa.get("aliquota_iva")),
+            "custom_motivo_esenzione_iva": cassa.get("natura") or None,
+        })
+        aggiunte = True
+
+    return aggiunte
+
+
+def _add_bollo_e_ritenuta(pi, invoice_data):
+    """Bollo e ritenuta d'acconto dalla testata XML, come righe 'Purchase Taxes and
+    Charges' di tipo Actual (descrizione che inizia per 'Bollo' / 'Ritenuta':
+    registri_iva le riconosce e non le tratta come IVA).
+
+    - Bollo: DatiBollo e' solo un'indicazione. Se il fornitore lo addebita come riga
+      (rivalsa, di solito natura N1) e' gia' tra gli articoli; se lo addebita solo in
+      testata e' compreso in ImportoTotaleDocumento ma non nelle righe. Per non
+      contarlo due volte si aggiunge solo se la differenza tra il totale XML e il
+      totale della PI e' esattamente l'importo del bollo.
+    - Ritenuta: riga 'Deduct' sul conto erario c/ritenute. Riduce il dovuto al
+      fornitore, non e' compresa in ImportoTotaleDocumento. Non usare in
+      contemporanea 'Apply Tax Withholding Amount' di ERPNext sulla stessa fattura
+      (raddoppierebbe la ritenuta)."""
+    dati = _get_dati_generali_documento(invoice_data)
+    segno = _segno(pi)
+
+    # --- Bollo ---
+    bollo = flt((dati.get("dati_bollo") or {}).get("importo_bollo"))
+    totale_xml = flt(dati.get("importo_totale_documento"))
+    if bollo and totale_xml:
+        totale_atteso = segno * abs(totale_xml)
+        mancante = round(totale_atteso - flt(pi.grand_total), 2)
+        if abs(mancante - segno * bollo) < 0.005:
+            conto = _get_account_by_number(pi.company, CONTO_BOLLO)
+            if conto:
+                pi.append("taxes", {
+                    "charge_type": "Actual",
+                    "account_head": conto,
+                    "tax_amount": segno * bollo,
+                    "category": "Total",
+                    "add_deduct_tax": "Add",
+                    "description": "Bollo (DatiBollo XML)",  # non tradurre: vedi RIGHE_NON_IVA_RE
+                })
+            else:
+                frappe.msgprint(
+                    _("Bollo di {0} presente nell'XML ma conto {1} non trovato: riga non aggiunta").format(
+                        bollo, CONTO_BOLLO
+                    ),
+                    alert=True,
+                    indicator="orange",
+                )
+
+    # --- Ritenuta d'acconto ---
+    ritenute = _as_list(dati.get("dati_ritenuta"))
+    totale_ritenuta = sum(flt(r.get("importo_ritenuta")) for r in ritenute)
+    if totale_ritenuta:
+        conto = _get_account_by_number(pi.company, CONTO_RITENUTA)
+        if conto:
+            prima = ritenute[0]
+            # La descrizione deve iniziare per "Ritenuta": registri_iva la usa per
+            # riconoscere le righe che non sono IVA (non tradurre questa stringa)
+            parti = ["Ritenuta d'acconto", prima.get("tipo_ritenuta")]
+            if prima.get("aliquota_ritenuta"):
+                parti.append(f"{prima['aliquota_ritenuta']}%")
+            descrizione = " ".join(p for p in parti if p)
+            if prima.get("causale_pagamento"):
+                descrizione += f" (causale {prima['causale_pagamento']})"
+            pi.append("taxes", {
+                "charge_type": "Actual",
+                "account_head": conto,
+                "tax_amount": segno * totale_ritenuta,
+                "category": "Total",
+                "add_deduct_tax": "Deduct",
+                "description": descrizione,
+            })
+            # La ritenuta e' gia' in fattura: evita che ERPNext ne aggiunga una seconda
+            # se il fornitore ha una Tax Withholding Category
+            pi.apply_tds = 0
+        else:
+            frappe.msgprint(
+                _("Ritenuta di {0} presente nell'XML ma conto {1} non trovato: riga non aggiunta").format(
+                    totale_ritenuta, CONTO_RITENUTA
+                ),
+                alert=True,
+                indicator="orange",
+            )
+
+
+def _set_td16_se_reverse_charge(pi, invoice_data):
+    """Fattura con natura N6.x (inversione contabile interna): la PI va integrata e
+    registrata anche nelle vendite. Si imposta TD16 sul tipo documento, cosi' alla
+    submit registri_iva genera il Documento Integrativo (se esiste un Sezionale IVA
+    di vendita auto-generato con TD16 tra i tipi documento che lo attivano).
+
+    Richiede che TD16 sia classificato 'AutoFattura' in 'Tipologia di documento
+    e-Invoice' (il campo Tipo Documento della PI accetta solo quelle)."""
+    if not any((r.get("natura") or "").upper().startswith("N6") for r in _get_riepilogo(invoice_data)):
+        return
+
+    tipologia = frappe.db.get_value("Tipologia di documento e-Invoice", "TD16", "tipologia")
+    if tipologia != "AutoFattura":
+        frappe.msgprint(
+            _(
+                "Fattura in inversione contabile (N6): impostare a mano il tipo documento TD16. "
+                "TD16 deve prima essere classificato 'AutoFattura' in Tipologia di documento e-Invoice."
+            ),
+            alert=True,
+            indicator="orange",
+        )
+        return
+
+    pi.custom_tipo_di_documento = "TD16"
+
+
 @frappe.whitelist()
 def process_supplier_invoice_fixed(
     invoice_data, fattura_fornitori_sdi=None, item_mappings=None, remember_mappings=None
@@ -196,10 +454,16 @@ def process_supplier_invoice_fixed(
     2. Ripristina il calcolo normale del Rounding Adjustment
     3. Usa Data Registrazione (SDI) come Posting Date, se disponibile
     4. Usa DataScadenzaPagamento come Due Date, se presente nell'XML
-    5. Ripristina il rate sulle righe tasse Actual (per il Registro IVA)
-    6. Inietta lo scarto di arrotondamento residuo (imponibile XML vs somma
+    5. Ripristina il rate sulle righe tasse IVA Actual
+    6. Aggiunge il contributo cassa previdenziale come articolo (e' compreso
+       nell'imponibile del riepilogo IVA)
+    7. Inietta lo scarto di arrotondamento residuo (imponibile XML vs somma
        righe ERPNext) come riga di tolleranza, spalmata sul magazzino o a
-       conto economico a seconda che la fattura movimenti stock
+       conto economico a seconda che la fattura movimenti stock. Sulle note di
+       credito il dichiarato XML e' portato in negativo.
+    8. Aggiunge bollo (se addebitato in testata) e ritenuta d'acconto
+    9. Elimina le righe tassa vuote su conti padre (es. CREDITI TRIBUTARI)
+    10. Imposta TD16 sulle fatture in inversione contabile interna (natura N6)
     """
     if isinstance(invoice_data, str):
         invoice_data = json.loads(invoice_data)
@@ -232,10 +496,23 @@ def process_supplier_invoice_fixed(
             pi.posting_date = posting_date
             pi.set_posting_time = 1
 
+    _remove_empty_group_tax_rows(pi)
+
+    # La cassa entra nel net_total PRIMA del confronto con l'imponibile dichiarato
+    if _add_cassa_items(pi, invoice_data):
+        pi.calculate_taxes_and_totals()
+
     _inject_rounding_tolerance(pi, invoice_data)
 
     pi.disable_rounded_total = 0
     pi.calculate_taxes_and_totals()
+
+    # Bollo e ritenuta si valutano sul totale gia' quadrato con l'XML
+    _add_bollo_e_ritenuta(pi, invoice_data)
+    pi.calculate_taxes_and_totals()
+
+    _set_td16_se_reverse_charge(pi, invoice_data)
+
     pi.save(ignore_permissions=True)
 
     import re
@@ -246,7 +523,8 @@ def process_supplier_invoice_fixed(
         fields=["name", "rate", "description"],
     )
     for row in tax_rows:
-        if not row.rate:
+        # Solo le righe IVA: "Ritenuta d'acconto 20%" non deve diventare una riga con rate 20
+        if not row.rate and (row.description or "").upper().startswith("IVA"):
             match = re.search(r"(\d+(?:\.\d+)?)\s*%", row.description or "")
             if match:
                 frappe.db.set_value(
